@@ -112,6 +112,17 @@ public class GetAnomalies extends AbstractCostExplorer implements RunnableTask<G
 
     @Override
     public Output run(RunContext runContext) throws Exception {
+        return read(runContext, null).output();
+    }
+
+    /**
+     * The pages read from {@code startPageToken} (the first page when null), and the token of the first page not read,
+     * null when every page was read.
+     */
+    record Page(Output output, String nextPageToken) {
+    }
+
+    Page read(RunContext runContext, String startPageToken) throws Exception {
         var rStartDate = requiredDate(runContext, startDate, "startDate");
         var rEndDate = requiredDate(runContext, endDate, "endDate");
         if (rEndDate.isBefore(rStartDate)) {
@@ -134,7 +145,7 @@ public class GetAnomalies extends AbstractCostExplorer implements RunnableTask<G
         var stoppedAtFirstRow = false;
         var rows = new ArrayList<Map<String, Object>>();
         var totalImpact = BigDecimal.ZERO;
-        String nextPageToken = null;
+        var nextPageToken = startPageToken;
         var pages = 0;
 
         try (var client = client(runContext)) {
@@ -160,7 +171,7 @@ public class GetAnomalies extends AbstractCostExplorer implements RunnableTask<G
         }
 
         var fetched = BillingFetch.apply(runContext, rFetchType, rows);
-        return Output.builder()
+        var output = Output.builder()
             .rows(fetched.rows())
             .row(fetched.row())
             .uri(fetched.uri())
@@ -168,6 +179,7 @@ public class GetAnomalies extends AbstractCostExplorer implements RunnableTask<G
             .totalImpact(totalImpact)
             .truncated(nextPageToken != null)
             .build();
+        return new Page(output, nextPageToken);
     }
 
     static Map<String, Object> toMap(Anomaly anomaly) {

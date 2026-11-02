@@ -142,8 +142,74 @@ class AnomalyTriggerTest {
         assertThat(persistedIds(context, raw), empty());
     }
 
+    @Test
+    void givenMorePagesThanMaxPages_whenEvaluateAgain_thenNextPollContinuesFromTheFirstPageNotRead() throws Exception {
+        server.stubFor(
+            post("/").withHeader("X-Amz-Target", equalTo(GET_ANOMALIES))
+                .withRequestBody(notContaining("NextPageToken"))
+                .willReturn(okJson("{\"Anomalies\":[" + anomaly("a-1", "2026-10-18", null, 150.0) + "],\"NextPageToken\":\"page-2\"}"))
+        );
+        server.stubFor(
+            post("/").withHeader("X-Amz-Target", equalTo(GET_ANOMALIES))
+                .withRequestBody(matchingJsonPath("$.NextPageToken", equalTo("page-2")))
+                .willReturn(okJson("{\"Anomalies\":[" + anomaly("a-2", "2026-10-19", null, 80.0) + "]}"))
+        );
+        var raw = rawTrigger(null, 1);
+        var trigger = spyToday(raw, TODAY);
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+
+        assertThat(anomalyIds(trigger.evaluate(context.getKey(), context.getValue())), contains("a-1"));
+        assertThat(anomalyIds(trigger.evaluate(context.getKey(), context.getValue())), contains("a-2"));
+        server.verify(1, postRequestedFor(urlEqualTo("/")).withRequestBody(matchingJsonPath("$.NextPageToken", equalTo("page-2"))));
+
+        // the cursor is cleared once the last page is read, so the next poll starts from the first page again
+        assertThat(trigger.evaluate(context.getKey(), context.getValue()).isPresent(), is(false));
+        server.verify(2, postRequestedFor(urlEqualTo("/")).withRequestBody(notContaining("NextPageToken")));
+        assertThat(persistedIds(context, raw), containsInAnyOrder("a-1", "a-2"));
+    }
+
+    @Test
+    void givenSavedCursorForAnotherDay_whenEvaluate_thenStartsFromTheFirstPage() throws Exception {
+        server.stubFor(
+            post("/").withHeader("X-Amz-Target", equalTo(GET_ANOMALIES))
+                .withRequestBody(notContaining("NextPageToken"))
+                .willReturn(okJson("{\"Anomalies\":[" + anomaly("a-1", "2026-10-18", null, 150.0) + "],\"NextPageToken\":\"page-2\"}"))
+        );
+        var raw = rawTrigger(null, 1);
+        var context = TestsUtils.mockTrigger(runContextFactory, spyToday(raw, TODAY));
+        assertThat(anomalyIds(spyToday(raw, TODAY).evaluate(context.getKey(), context.getValue())), contains("a-1"));
+
+        // a page token is only valid for the request that returned it, and the window moved by a day
+        assertThat(spyToday(raw, TODAY.plusDays(1)).evaluate(context.getKey(), context.getValue()).isPresent(), is(false));
+        server.verify(0, postRequestedFor(urlEqualTo("/")).withRequestBody(matchingJsonPath("$.NextPageToken")));
+    }
+
+    @Test
+    void givenNothingChanged_whenEvaluateAgain_thenWatermarkIsNotRewritten() throws Exception {
+        stubAnomalies(anomaly("a-1", "2026-10-18", null, 150.0));
+        var raw = rawTrigger(null);
+        var trigger = spyToday(raw, TODAY);
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        assertThat(anomalyIds(trigger.evaluate(context.getKey(), context.getValue())), contains("a-1"));
+
+        var kvStore = context.getKey().getRunContext().namespaceKv(context.getValue().getNamespace());
+        var key = StatefulTriggerService.defaultKey(context.getValue().getNamespace(), context.getValue().getFlowId(), raw.getId());
+        var updated = kvStore.get(key).orElseThrow().updateDate();
+
+        assertThat(trigger.evaluate(context.getKey(), context.getValue()).isPresent(), is(false));
+        assertThat(kvStore.get(key).orElseThrow().updateDate(), is(updated));
+    }
+
     private AnomalyTrigger rawTrigger(Double minImpactUsd) {
-        return AnomalyTrigger.builder()
+        return rawTrigger(minImpactUsd, null);
+    }
+
+    private AnomalyTrigger rawTrigger(Double minImpactUsd, Integer maxPages) {
+        var builder = AnomalyTrigger.builder();
+        if (maxPages != null) {
+            builder.maxPages(Property.ofValue(maxPages));
+        }
+        return builder
             .id(IdUtils.create())
             .type(AnomalyTrigger.class.getName())
             .region(Property.ofValue("us-east-1"))

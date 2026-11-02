@@ -25,6 +25,9 @@ import io.kestra.core.models.triggers.StatefulTriggerService;
 import io.kestra.core.models.triggers.TriggerContext;
 import io.kestra.core.models.triggers.TriggerOutput;
 import io.kestra.core.models.triggers.TriggerService;
+import io.kestra.core.storages.kv.KVMetadata;
+import io.kestra.core.storages.kv.KVStore;
+import io.kestra.core.storages.kv.KVValueAndMetadata;
 
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.Max;
@@ -86,6 +89,7 @@ import lombok.experimental.SuperBuilder;
 )
 public class AnomalyTrigger extends AbstractBillingTrigger implements TriggerOutput<AnomalyTrigger.Output> {
     static final Duration DEFAULT_LOOKBACK = Duration.ofDays(7);
+    static final String CURSOR_KEY_SUFFIX = "_cursor";
 
     @Schema(
         title = "Poll interval",
@@ -129,8 +133,8 @@ public class AnomalyTrigger extends AbstractBillingTrigger implements TriggerOut
     @Schema(
         title = "Maximum number of pages",
         description = """
-            Stops after this many `GetAnomalies` requests per poll, each one costing $0.01. Anomalies on the pages not read are \
-            reported by a later poll. Default 10, between 1 and 1000."""
+            Stops after this many `GetAnomalies` requests per poll, each one costing $0.01. The next poll continues from the \
+            first page not read, so anomalies on later pages are reported by a later poll. Default 10, between 1 and 1000."""
     )
     @NotNull
     @Builder.Default
@@ -172,9 +176,21 @@ public class AnomalyTrigger extends AbstractBillingTrigger implements TriggerOut
             .maxPages(maxPages)
             .fetchType(Property.ofValue(FetchType.FETCH));
         copyConnection(task);
-        var fetched = task.build().run(runContext);
+
+        // a truncated read leaves a cursor, so the next poll reads the following pages instead of the first ones again
+        var kvStore = runContext.namespaceKv(context.getNamespace());
+        var cursorKey = rStateKey + CURSOR_KEY_SUFFIX;
+        var request = String.join(
+            "|", windowStart.toString(), rToday.toString(),
+            String.valueOf(runContext.render(monitorArn).as(String.class).orElse(null)), String.valueOf(rMinImpactUsd)
+        );
+        var startPageToken = readCursor(kvStore, cursorKey, request);
+        var page = task.build().read(runContext, startPageToken);
+        var fetched = page.output();
+        writeCursor(kvStore, cursorKey, request, startPageToken, page.nextPageToken());
 
         var state = StatefulTriggerService.readState(runContext, rStateKey, Optional.empty());
+        var stateBefore = Map.copyOf(state);
         var newAnomalies = new ArrayList<Map<String, Object>>();
         for (var anomaly : fetched.getRows()) {
             if (!(anomaly.get("anomalyId") instanceof String anomalyId) || !isAboveMinImpact(anomaly, rMinImpactUsd)) {
@@ -187,14 +203,16 @@ public class AnomalyTrigger extends AbstractBillingTrigger implements TriggerOut
             }
         }
 
-        // pages left unread may still hold old IDs, so prune only on a full read
-        if (!Boolean.TRUE.equals(fetched.getTruncated())) {
+        // pages left unread may still hold old IDs, so prune only when this poll read every page from the first one
+        if (startPageToken == null && page.nextPageToken() == null) {
             var windowStartInstant = windowStart.atStartOfDay(ZoneOffset.UTC).toInstant();
             state.values().removeIf(entry -> entry.modifiedAt() != null && entry.modifiedAt().isBefore(windowStartInstant));
         }
 
         if (newAnomalies.isEmpty()) {
-            StatefulTriggerService.writeState(runContext, rStateKey, state, Optional.empty());
+            if (!state.equals(stateBefore)) {
+                StatefulTriggerService.writeState(runContext, rStateKey, state, Optional.empty());
+            }
             logger.debug("No new cost anomaly between {} and {}", windowStart, rToday);
             return Optional.empty();
         }
@@ -217,6 +235,27 @@ public class AnomalyTrigger extends AbstractBillingTrigger implements TriggerOut
         StatefulTriggerService.writeState(runContext, rStateKey, state, Optional.empty());
         logger.info("{} new cost anomalies with {} USD of total impact", newAnomalies.size(), totalImpact);
         return Optional.of(execution);
+    }
+
+    /**
+     * The page token saved by the previous poll, when it was taken for the same request: a token is only valid for the
+     * request that returned it, and the request changes every day with the lookback window.
+     */
+    private static String readCursor(KVStore kvStore, String cursorKey, String request) throws Exception {
+        var cursor = kvStore.getValue(cursorKey);
+        if (cursor.isEmpty() || !(cursor.get().value() instanceof String saved)) {
+            return null;
+        }
+        var parts = saved.split("\n", 2);
+        return parts.length == 2 && parts[0].equals(request) ? parts[1] : null;
+    }
+
+    private static void writeCursor(KVStore kvStore, String cursorKey, String request, String startPageToken, String nextPageToken) throws Exception {
+        if (nextPageToken != null) {
+            kvStore.put(cursorKey, new KVValueAndMetadata(new KVMetadata("Cost anomaly trigger page cursor", (Duration) null), request + "\n" + nextPageToken));
+        } else if (startPageToken != null) {
+            kvStore.delete(cursorKey);
+        }
     }
 
     private static boolean isAboveMinImpact(Map<String, Object> anomaly, Double minImpactUsd) {
